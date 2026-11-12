@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+*.zip
+models-20261112T195822Z-1-001/
+.system_generated/
+
