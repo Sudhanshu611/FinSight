@@ -7,4 +7,4 @@ __pycache__/
 *.zip
 models-20261112T195822Z-1-001/
 .system_generated/
-
+models/finbert_pretrained/

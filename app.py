@@ -3,9 +3,17 @@ import sys
 import warnings
 from datetime import datetime
 import pandas as pd
+import numpy as np
 import streamlit as st
 import altair as alt
 import joblib
+
+# Set Keras backend to torch before importing keras
+os.environ["KERAS_BACKEND"] = "torch"
+try:
+    import keras
+except ImportError:
+    keras = None
 
 # Suppress scikit-learn unpickling warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -103,10 +111,10 @@ st.markdown("""
     .block-container {
         padding-top: 1.8rem !important;
         padding-bottom: 3rem !important;
-        max-width: 1280px !important;
+        max-width: 1350px !important;
     }
 
-    /* Inputs, Buttons, & Selectboxes */
+    /* Inputs & Selectboxes */
     input, textarea, [data-baseweb="input"], [data-baseweb="select"] {
         background-color: #FFFFFF !important;
         color: #000000 !important;
@@ -222,22 +230,37 @@ HISTORICAL_METRICS = {
         "name": "FinBERT",
         "tag": "Pre-trained Transformer",
         "accuracy": "78.97%",
-        "negative_f1": "0.64",
+        "f1_label": "Negative F1:",
+        "f1_val": "0.64",
+        "weighted_f1": "0.79",
         "description": "Pre-trained financial BERT fine-tuned on financial text. Uses bidirectional attention to capture context and financial terminology."
     },
     "SVM": {
         "name": "Linear SVM",
         "tag": "LinearSVC + SMOTE",
         "accuracy": "73.99%",
-        "negative_f1": "0.47",
+        "f1_label": "Negative F1:",
+        "f1_val": "0.47",
+        "weighted_f1": "0.74",
         "description": "Linear Support Vector Classifier trained on 5,000 TF-IDF features with SMOTE class balancing for fast maximum-margin decision boundaries."
     },
     "Logistic Regression": {
         "name": "Logistic Regression",
         "tag": "LogisticRegression + SMOTE",
         "accuracy": "73.62%",
-        "negative_f1": "0.52",
+        "f1_label": "Negative F1:",
+        "f1_val": "0.52",
+        "weighted_f1": "0.74",
         "description": "L2-regularized Logistic Regression classifier using 5,000 TF-IDF features with SMOTE oversampling for calibrated probabilistic predictions."
+    },
+    "BiLSTM": {
+        "name": "BiLSTM",
+        "tag": "Bidirectional LSTM (Weighted)",
+        "accuracy": "72.00%",
+        "f1_label": "Weighted F1:",
+        "f1_val": "0.72",
+        "weighted_f1": "0.72",
+        "description": "Bidirectional Long Short-Term Memory recurrent neural network capturing sequential forward and backward textual dependencies."
     }
 }
 
@@ -264,9 +287,33 @@ def resolve_models_path():
                 return candidate
     return colab_path
 
-@st.cache_resource(show_spinner="Loading models...")
+def tokenize_for_bilstm(headlines, bilstm_tokenizer=None, tfidf_vec=None, max_len=100):
+    """
+    Transforms headlines into padded integer sequences of shape (len, max_len).
+    Uses bilstm_tokenizer if available, or tfidf vocabulary as aligned fallback.
+    """
+    if bilstm_tokenizer is not None and hasattr(bilstm_tokenizer, "texts_to_sequences"):
+        seqs = bilstm_tokenizer.texts_to_sequences(headlines)
+    elif bilstm_tokenizer is not None and isinstance(bilstm_tokenizer, dict):
+        seqs = [[bilstm_tokenizer.get(w.lower(), 1) for w in h.split()] for h in headlines]
+    elif tfidf_vec is not None and hasattr(tfidf_vec, "vocabulary_"):
+        # Aligned vocabulary mapping: index + 1 (reserve 0 for padding)
+        seqs = [[tfidf_vec.vocabulary_.get(w.lower(), 1) + 1 for w in h.split()] for h in headlines]
+    else:
+        seqs = [[1] for _ in headlines]
+
+    padded = []
+    for s in seqs:
+        if not s:
+            s = [0]
+        s_cut = s[:max_len]
+        s_pad = s_cut + [0] * max(0, max_len - len(s_cut))
+        padded.append(s_pad)
+    return np.array(padded, dtype=np.float32)
+
+@st.cache_resource(show_spinner="Loading FinBERT, SVM, Logistic Regression, BiLSTM, and Tokenizer...")
 def load_all_models(models_dir):
-    """Loads FinBERT, SVM, Logistic Regression, and TF-IDF Vectorizer."""
+    """Loads all four models (FinBERT, SVM, Logistic Regression, BiLSTM) and vectorizer."""
     import torch
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
@@ -274,8 +321,9 @@ def load_all_models(models_dir):
     svm_path = os.path.join(models_dir, "svm_smote_model.joblib")
     lr_path = os.path.join(models_dir, "logistic_regression_smote_model.joblib")
     tfidf_path = os.path.join(models_dir, "tfidf_vectorizer.joblib")
+    bilstm_path = os.path.join(models_dir, "bilstm_weighted_model.keras")
 
-    # Verify classical model files (under 500KB total)
+    # Verify classical model files
     missing = []
     for p, desc in [
         (svm_path, "SVM model"),
@@ -288,22 +336,49 @@ def load_all_models(models_dir):
     if missing:
         raise FileNotFoundError("Missing model files:\n• " + "\n• ".join(missing))
 
-    # Load FinBERT: from local/drive directory if present, else fallback to Hugging Face Hub
+    # 1. Load FinBERT: local directory if present, else Hugging Face Hub
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if os.path.exists(finbert_path):
         tokenizer = AutoTokenizer.from_pretrained(finbert_path)
         finbert_model = AutoModelForSequenceClassification.from_pretrained(finbert_path)
     else:
-        # Cloud deployment fallback (ProsusAI/finbert on Hugging Face Hub)
         tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
         finbert_model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
 
     finbert_model.to(device)
     finbert_model.eval()
 
+    # 2. Classical Models
     svm_model = joblib.load(svm_path)
     lr_model = joblib.load(lr_path)
     tfidf_vectorizer = joblib.load(tfidf_path)
+
+    # 3. BiLSTM Model & Tokenizer
+    bilstm_model = None
+    bilstm_tok = None
+    if os.path.exists(bilstm_path) and keras is not None:
+        try:
+            bilstm_model = keras.models.load_model(bilstm_path)
+        except Exception as e:
+            st.warning(f"Note: Could not load BiLSTM model: {e}")
+
+    # Check for optional BiLSTM tokenizer file
+    tok_candidates = [
+        os.path.join(models_dir, "bilstm_tokenizer.pickle"),
+        os.path.join(models_dir, "bilstm_tokenizer.pkl"),
+        os.path.join(models_dir, "tokenizer.pickle"),
+        os.path.join(models_dir, "tokenizer.pkl"),
+        os.path.join(models_dir, "bilstm_tokenizer.json"),
+    ]
+    for tc in tok_candidates:
+        if os.path.exists(tc):
+            try:
+                import pickle
+                with open(tc, "rb") as f:
+                    bilstm_tok = pickle.load(f)
+                break
+            except Exception:
+                pass
 
     return {
         "tokenizer": tokenizer,
@@ -312,6 +387,8 @@ def load_all_models(models_dir):
         "svm": svm_model,
         "lr": lr_model,
         "vectorizer": tfidf_vectorizer,
+        "bilstm": bilstm_model,
+        "bilstm_tokenizer": bilstm_tok,
         "models_dir": models_dir
     }
 
@@ -338,6 +415,8 @@ def run_multi_model_inference(headlines, bundle):
     svm = bundle["svm"]
     lr = bundle["lr"]
     vectorizer = bundle["vectorizer"]
+    bilstm = bundle.get("bilstm")
+    bilstm_tok = bundle.get("bilstm_tokenizer")
 
     # 1. FinBERT Inference
     encoded = tokenizer(
@@ -365,18 +444,43 @@ def run_multi_model_inference(headlines, bundle):
     svm_preds = [standardize_label(p) for p in svm.predict(X_tfidf)]
     lr_preds = [standardize_label(p) for p in lr.predict(X_tfidf)]
 
+    # 3. BiLSTM Inference
+    bilstm_preds = []
+    bilstm_confidences = []
+    if bilstm is not None:
+        X_bilstm = tokenize_for_bilstm(headlines, bilstm_tok, vectorizer, max_len=100)
+        try:
+            bilstm_raw = bilstm.predict(X_bilstm, verbose=0)
+            b_indices = np.argmax(bilstm_raw, axis=-1)
+            b_confs = np.max(bilstm_raw, axis=-1).tolist()
+            # Mapping: 0: negative, 1: neutral, 2: positive (from training notebook)
+            b_map = {0: "Negative", 1: "Neutral", 2: "Positive"}
+            bilstm_preds = [b_map.get(idx, "Neutral") for idx in b_indices]
+            bilstm_confidences = b_confs
+        except Exception as e:
+            bilstm_preds = ["Neutral"] * len(headlines)
+            bilstm_confidences = [0.0] * len(headlines)
+    else:
+        bilstm_preds = ["Neutral"] * len(headlines)
+        bilstm_confidences = [0.0] * len(headlines)
+
     results = []
     for i in range(len(headlines)):
         fb = finbert_preds[i]
         sv = svm_preds[i]
         lrg = lr_preds[i]
+        bl = bilstm_preds[i]
+        # Full consensus across models
+        is_consensus = (fb == sv == lrg == bl) if bilstm is not None else (fb == sv == lrg)
         results.append({
             "headline": headlines[i],
             "finbert": fb,
             "finbert_confidence": confidences[i],
             "svm": sv,
             "lr": lrg,
-            "is_consensus": (fb == sv == lrg)
+            "bilstm": bl,
+            "bilstm_confidence": bilstm_confidences[i] if i < len(bilstm_confidences) else 0.0,
+            "is_consensus": is_consensus
         })
     return results
 
@@ -478,7 +582,7 @@ def main():
     <div class="app-header">
         <h1 class="app-title">FinSight: Real-Time Sentiment &amp; Model Comparison</h1>
         <div class="app-subtitle">
-            A minimalist evaluation interface comparing <b>FinBERT</b>, <b>Linear SVM</b>, and <b>Logistic Regression</b> on real-time market headlines.
+            A minimalist evaluation interface comparing <b>FinBERT</b>, <b>Linear SVM</b>, <b>Logistic Regression</b>, and <b>BiLSTM</b> on real-time market headlines.
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -541,7 +645,7 @@ def main():
                 st.session_state["ticker"] = active_ticker
             else:
                 headlines = [a["headline"] for a in raw_articles]
-                with st.spinner("Analyzing sentiment across all 3 models..."):
+                with st.spinner("Analyzing sentiment across all 4 models..."):
                     inferences = run_multi_model_inference(headlines, bundle)
                     st.session_state["articles"] = raw_articles
                     st.session_state["inferences"] = inferences
@@ -559,10 +663,12 @@ def main():
     fb_preds = [item["finbert"] for item in inferences]
     svm_preds = [item["svm"] for item in inferences]
     lr_preds = [item["lr"] for item in inferences]
+    bl_preds = [item["bilstm"] for item in inferences]
 
     fb_summary = calculate_sentiment_summary(fb_preds)
     svm_summary = calculate_sentiment_summary(svm_preds)
     lr_summary = calculate_sentiment_summary(lr_preds)
+    bl_summary = calculate_sentiment_summary(bl_preds)
 
     total_count = len(inferences)
     consensus_count = sum(1 for item in inferences if item["is_consensus"])
@@ -574,24 +680,25 @@ def main():
         f'<div class="summary-badge">'
         f'<div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">'
         f'<div><span style="font-size: 0.85rem; color: #4B5563;">Target Asset:</span> <b>${ticker}</b> &nbsp;|&nbsp; <span style="font-size: 0.85rem; color: #4B5563;">Headlines:</span> <b>{total_count}</b></div>'
-        f'<div><span style="font-size: 0.85rem; color: #4B5563;">Full Consensus:</span> <b>{consensus_count}/{total_count} ({consensus_rate:.1f}%)</b> &nbsp;|&nbsp; <span style="font-size: 0.85rem; color: #4B5563;">Discrepancies:</span> <b>{discrepancy_count}</b></div>'
+        f'<div><span style="font-size: 0.85rem; color: #4B5563;">Full 4-Model Consensus:</span> <b>{consensus_count}/{total_count} ({consensus_rate:.1f}%)</b> &nbsp;|&nbsp; <span style="font-size: 0.85rem; color: #4B5563;">Discrepancies:</span> <b>{discrepancy_count}</b></div>'
         f'</div>'
         f'</div>',
         unsafe_allow_html=True
     )
 
-    # Section 2: Model Comparison Cards (Three Columns)
+    # Section 2: Model Comparison Cards (Four Columns)
     st.markdown('<div class="section-title">Model Sentiment Comparison</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-desc">Side-by-side comparison of live aggregated sentiment distribution and static test set benchmarks across all three models.</div>',
+        '<div class="section-desc">Side-by-side comparison of live aggregated sentiment distribution and static test set benchmarks across all four models.</div>',
         unsafe_allow_html=True
     )
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     models_config = [
         (col1, fb_summary, HISTORICAL_METRICS["FinBERT"]),
         (col2, svm_summary, HISTORICAL_METRICS["SVM"]),
         (col3, lr_summary, HISTORICAL_METRICS["Logistic Regression"]),
+        (col4, bl_summary, HISTORICAL_METRICS["BiLSTM"]),
     ]
 
     for col, summary, hist in models_config:
@@ -600,34 +707,34 @@ def main():
                 # Header row: Name + Dominant Pill
                 st.markdown(
                     f'<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">'
-                    f'<span style="font-size: 1.18rem; font-weight: 800; color: #000000;">{hist["name"]}</span>'
+                    f'<span style="font-size: 1.15rem; font-weight: 800; color: #000000;">{hist["name"]}</span>'
                     f'{get_sentiment_pill(summary["dominant"])}'
                     f'</div>',
                     unsafe_allow_html=True
                 )
-                st.markdown(f'<div style="font-size: 0.82rem; color: #374151; margin-bottom: 8px;">{hist["description"]}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div style="font-size: 0.80rem; color: #374151; min-height: 48px; margin-bottom: 8px;">{hist["description"]}</div>', unsafe_allow_html=True)
 
                 # Aggregated Live Metrics
-                st.markdown('<div style="font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #000000; margin-bottom: 6px;">Live Sentiment Breakdown</div>', unsafe_allow_html=True)
+                st.markdown('<div style="font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #000000; margin-bottom: 6px;">Live Sentiment Breakdown</div>', unsafe_allow_html=True)
                 s1, s2, s3 = st.columns(3)
                 s1.markdown(
                     f'<div style="background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 6px; padding: 6px; text-align: center;">'
-                    f'<div style="color: #065F46; font-weight: 800; font-size: 0.95rem;">{summary["pos_pct"]:.1f}%</div>'
-                    f'<div style="color: #000000; font-size: 0.72rem; font-weight: 600;">Pos ({summary["pos_count"]})</div>'
+                    f'<div style="color: #065F46; font-weight: 800; font-size: 0.88rem;">{summary["pos_pct"]:.1f}%</div>'
+                    f'<div style="color: #000000; font-size: 0.70rem; font-weight: 600;">Pos ({summary["pos_count"]})</div>'
                     f'</div>',
                     unsafe_allow_html=True
                 )
                 s2.markdown(
                     f'<div style="background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 6px; padding: 6px; text-align: center;">'
-                    f'<div style="color: #18181B; font-weight: 800; font-size: 0.95rem;">{summary["neu_pct"]:.1f}%</div>'
-                    f'<div style="color: #000000; font-size: 0.72rem; font-weight: 600;">Neu ({summary["neu_count"]})</div>'
+                    f'<div style="color: #18181B; font-weight: 800; font-size: 0.88rem;">{summary["neu_pct"]:.1f}%</div>'
+                    f'<div style="color: #000000; font-size: 0.70rem; font-weight: 600;">Neu ({summary["neu_count"]})</div>'
                     f'</div>',
                     unsafe_allow_html=True
                 )
                 s3.markdown(
                     f'<div style="background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 6px; padding: 6px; text-align: center;">'
-                    f'<div style="color: #991B1B; font-weight: 800; font-size: 0.95rem;">{summary["neg_pct"]:.1f}%</div>'
-                    f'<div style="color: #000000; font-size: 0.72rem; font-weight: 600;">Neg ({summary["neg_count"]})</div>'
+                    f'<div style="color: #991B1B; font-weight: 800; font-size: 0.88rem;">{summary["neg_pct"]:.1f}%</div>'
+                    f'<div style="color: #000000; font-size: 0.70rem; font-weight: 600;">Neg ({summary["neg_count"]})</div>'
                     f'</div>',
                     unsafe_allow_html=True
                 )
@@ -645,10 +752,10 @@ def main():
                 # Historical Test Metrics
                 st.markdown(
                     f'<div style="background: #FAFAFA; border: 1px solid #E5E7EB; border-radius: 6px; padding: 8px 10px; margin-top: 6px;">'
-                    f'<div style="font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #000000; margin-bottom: 4px;">Historical Test Performance</div>'
+                    f'<div style="font-size: 0.70rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #000000; margin-bottom: 4px;">Historical Benchmark</div>'
                     f'<div style="display: flex; justify-content: space-between; align-items: center;">'
-                    f'<div><span style="font-size: 0.72rem; color: #4B5563;">Test Accuracy:</span><br><b style="font-size: 1.08rem; color: #000000;">{hist["accuracy"]}</b></div>'
-                    f'<div><span style="font-size: 0.72rem; color: #4B5563;">Negative F1:</span><br><b style="font-size: 1.08rem; color: #000000;">{hist["negative_f1"]}</b></div>'
+                    f'<div><span style="font-size: 0.70rem; color: #4B5563;">Accuracy:</span><br><b style="font-size: 1.02rem; color: #000000;">{hist["accuracy"]}</b></div>'
+                    f'<div><span style="font-size: 0.70rem; color: #4B5563;">{hist["f1_label"]}</span><br><b style="font-size: 1.02rem; color: #000000;">{hist["f1_val"]}</b></div>'
                     f'</div>'
                     f'</div>',
                     unsafe_allow_html=True
@@ -658,9 +765,14 @@ def main():
 
     # Section 3: Sentiment Distribution Chart
     with st.expander("View Sentiment Distribution Chart", expanded=False):
-        st.markdown('<div class="section-desc">Visual comparison of sentiment proportions across all three models.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-desc">Visual comparison of sentiment proportions across all four models.</div>', unsafe_allow_html=True)
         chart_data = []
-        for model_lbl, sum_obj in [("FinBERT", fb_summary), ("Linear SVM", svm_summary), ("Logistic Regression", lr_summary)]:
+        for model_lbl, sum_obj in [
+            ("FinBERT", fb_summary),
+            ("Linear SVM", svm_summary),
+            ("Logistic Regression", lr_summary),
+            ("BiLSTM", bl_summary)
+        ]:
             for sent_cat, pct, cnt in [
                 ("Positive", sum_obj["pos_pct"], sum_obj["pos_count"]),
                 ("Neutral", sum_obj["neu_pct"], sum_obj["neu_count"]),
@@ -695,7 +807,7 @@ def main():
     # Section 4: Unified News Feed Table
     st.markdown('<div class="section-title">Live News Feed &amp; Prediction Audit</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-desc">Inspect live headlines alongside individual predictions from FinBERT, Linear SVM, and Logistic Regression to detect model discrepancies.</div>',
+        '<div class="section-desc">Inspect live headlines alongside individual predictions from FinBERT, Linear SVM, Logistic Regression, and BiLSTM to detect model discrepancies.</div>',
         unsafe_allow_html=True
     )
 
@@ -729,9 +841,10 @@ def main():
             "Time": art["time"],
             "Publisher": art["publisher"],
             "Headline": art["headline"],
-            "FinBERT Sentiment": inf["finbert"],
-            "SVM Sentiment": inf["svm"],
-            "Logistic Regression Sentiment": inf["lr"],
+            "FinBERT": inf["finbert"],
+            "SVM": inf["svm"],
+            "Logistic Reg": inf["lr"],
+            "BiLSTM": inf["bilstm"],
             "Agreement": "Consensus" if is_cons else "Discrepancy",
             "Article Link": art["url"]
         })
@@ -756,7 +869,7 @@ def main():
 
         styled_feed = df_feed.style.map(
             style_cells,
-            subset=["FinBERT Sentiment", "SVM Sentiment", "Logistic Regression Sentiment", "Agreement"]
+            subset=["FinBERT", "SVM", "Logistic Reg", "BiLSTM", "Agreement"]
         )
 
         st.dataframe(
@@ -766,9 +879,10 @@ def main():
                 "Time": st.column_config.TextColumn("Time", width="medium"),
                 "Publisher": st.column_config.TextColumn("Publisher", width="medium"),
                 "Headline": st.column_config.TextColumn("Headline", width="large"),
-                "FinBERT Sentiment": st.column_config.TextColumn("FinBERT", width="small"),
-                "SVM Sentiment": st.column_config.TextColumn("SVM", width="small"),
-                "Logistic Regression Sentiment": st.column_config.TextColumn("Logistic Reg", width="small"),
+                "FinBERT": st.column_config.TextColumn("FinBERT", width="small"),
+                "SVM": st.column_config.TextColumn("SVM", width="small"),
+                "Logistic Reg": st.column_config.TextColumn("Logistic Reg", width="small"),
+                "BiLSTM": st.column_config.TextColumn("BiLSTM", width="small"),
                 "Agreement": st.column_config.TextColumn("Agreement", width="small"),
                 "Article Link": st.column_config.LinkColumn("Link", width="small")
             },
@@ -789,7 +903,7 @@ def main():
     # Section 5: Custom Headline Testing Sandbox
     st.markdown('<div class="section-title">Test Custom Headline</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-desc">Type any financial headline or statement to observe live predictions across all three models.</div>',
+        '<div class="section-desc">Type any financial headline or statement to observe live predictions across all four models simultaneously.</div>',
         unsafe_allow_html=True
     )
 
@@ -813,7 +927,7 @@ def main():
         if custom_input.strip():
             test_res = run_multi_model_inference([custom_input.strip()], bundle)[0]
             
-            t1, t2, t3 = st.columns(3)
+            t1, t2, t3, t4 = st.columns(4)
             with t1:
                 with st.container(border=True):
                     st.markdown("**FinBERT**")
@@ -829,6 +943,11 @@ def main():
                     st.markdown("**Logistic Regression**")
                     st.markdown(get_sentiment_pill(test_res["lr"]), unsafe_allow_html=True)
                     st.caption("TF-IDF + LogisticRegression")
+            with t4:
+                with st.container(border=True):
+                    st.markdown("**BiLSTM**")
+                    st.markdown(get_sentiment_pill(test_res["bilstm"]), unsafe_allow_html=True)
+                    st.caption("Bidirectional LSTM (Weighted)")
 
 if __name__ == "__main__":
     main()
